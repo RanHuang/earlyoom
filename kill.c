@@ -26,6 +26,7 @@
 
 // Buffer size for UID/GID/PID string conversion
 #define UID_BUFSIZ 128
+#define VM_RSS_BUFSIZ 128
 // At most 1 notification per second when --dryrun is active
 #define NOTIFY_RATELIMIT 1
 
@@ -82,14 +83,17 @@ static void notify_ext(const char* script, const procinfo_t* victim)
 
     char pid_str[UID_BUFSIZ] = { 0 };
     char uid_str[UID_BUFSIZ] = { 0 };
+    char vm_rss_str[VM_RSS_BUFSIZ] = { 0 };
 
     snprintf(pid_str, UID_BUFSIZ, "%d", victim->pid);
     snprintf(uid_str, UID_BUFSIZ, "%d", victim->uid);
+    snprintf(vm_rss_str, VM_RSS_BUFSIZ, "%lld", victim->VmRSSkiB / 1024);
 
     setenv("EARLYOOM_PID", pid_str, 1);
     setenv("EARLYOOM_UID", uid_str, 1);
     setenv("EARLYOOM_NAME", victim->name, 1);
     setenv("EARLYOOM_CMDLINE", victim->cmdline, 1);
+    setenv("EARLYOOM_VM_RSS_MB", vm_rss_str, 1);
 
     execl(script, script, NULL);
     warn("%s: exec %s failed: %s\n", __func__, script, strerror(errno));
