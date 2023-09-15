@@ -116,6 +116,7 @@ following environment variables:
 
     EARLYOOM_PID     Process PID
     EARLYOOM_NAME    Process name truncated to 16 bytes (as reported in /proc/PID/comm)
+    EARLYOOM_CMDLINE Process cmdline truncated to 256 bytes (as reported in /proc/PID/cmdline)
     EARLYOOM_UID     UID of the user running the process
 
 WARNING: `EARLYOOM_NAME` can contain spaces, newlines, special characters
@@ -157,6 +158,12 @@ that might have occurred due to the processes attaining a high oom_score.
 
 Use this option with caution as other processes might be sacrificed in place of the ignored
 processes when earlyoom determines to kill processes.
+
+### \-\-ignore-root-user
+Processes owned by root will not be killed
+
+### \-\-sort-by-rss
+find process with the largest rss (default oom_score)
 
 #### \-\-dryrun
 dry run (do not kill any processes)
