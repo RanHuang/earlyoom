@@ -300,14 +300,27 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
             return false;
         }
         if (args->prefer_regex && regexec(args->prefer_regex, cur->name, (size_t)0, NULL, 0) == 0) {
-            cur->badness += BADNESS_PREFER;
+            if (args->sort_by_rss) {
+                return true;
+            } else {
+                cur->badness += BADNESS_PREFER;
+            }
         }
         if (args->avoid_regex && regexec(args->avoid_regex, cur->name, (size_t)0, NULL, 0) == 0) {
-            cur->badness += BADNESS_AVOID;
+            if (args->sort_by_rss) {
+                return false;
+            } else {
+                cur->badness += BADNESS_AVOID;
+            }
         }
         if (args->ignore_regex && regexec(args->ignore_regex, cur->name, (size_t)0, NULL, 0) == 0) {
             return false;
         }
+    }
+
+    if (cur->VmRSSkiB == 0) {
+        // Kernel threads have zero rss
+        return false;
     }
 
     if (args->sort_by_rss) {
@@ -319,10 +332,6 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
                 return false;
             }
             cur->VmRSSkiB = res;
-        }
-        if (cur->VmRSSkiB == 0) {
-            // Kernel threads have zero rss
-            return false;
         }
         if (cur->VmRSSkiB < victim->VmRSSkiB) {
             return false;
@@ -346,10 +355,6 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
             cur->VmRSSkiB = res;
         }
 
-        if (cur->VmRSSkiB == 0) {
-            // Kernel threads have zero rss
-            return false;
-        }
         if (cur->badness == victim->badness && cur->VmRSSkiB <= victim->VmRSSkiB) {
             return false;
         }
