@@ -6,11 +6,13 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h> /* Definition of SYS_* constants */
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,6 +36,10 @@
 // At most 1 notification per second when --dryrun is active
 #define NOTIFY_RATELIMIT 1
 
+// Wait for at most this amount of milliseconds when invoking the pre-hook (otherwise
+// when the pre-hook gets spawned, it doesn't have time to act)
+#define PREHOOK_STARTUP_SLEEP_MS 200
+
 static bool isnumeric(char* str)
 {
     int i = 0;
@@ -53,52 +59,134 @@ static bool isnumeric(char* str)
     }
 }
 
-static void notify_dbus(const char* summary, const char* body)
+#ifndef SYS_pidfd_open
+// It's 434 on all architectures except Alpha. Sorry, Alpha users.
+#warning SYS_pidfd_open is not defined. Assuming 434.
+#define SYS_pidfd_open 434
+#endif
+
+static int pidfd_open(pid_t pid, unsigned int flags)
 {
-    int pid = fork();
-    if (pid > 0) {
-        // parent
+    return (int)syscall(SYS_pidfd_open, pid, flags);
+}
+
+#ifndef SYS_process_mrelease
+// It's 448 on all architectures except Alpha. Sorry, Alpha users.
+#warning SYS_process_mrelease is not defined. Assuming 448.
+#define SYS_process_mrelease 448
+#endif
+
+static int process_mrelease(int pidfd, unsigned int flags) {
+    return (int)syscall(SYS_process_mrelease, pidfd, flags);
+}
+
+static void notify_spawn_subprocess(const char* script, char* const argv[], const procinfo_t* victim, int timeout_ms)
+{
+    // Prevent our SIGCHLD handler from reaping
+    // children before we can
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+
+    pid_t pid1 = fork();
+
+    if (pid1 == -1) {
+        warn("%s: fork error: %s\n", __func__, strerror(errno));
+        goto out_unblock;
+    } else if (pid1 != 0) {
+        // we are the parent
+        int pidfd = pidfd_open(pid1, 0);
+        if (pidfd == -1) {
+            warn("%s: pidfd_open error: %s\n", __func__, strerror(errno));
+            goto out_unblock;
+        }
+        struct pollfd pollfd = { 0 };
+        pollfd.fd = pidfd;
+        pollfd.events = POLLIN;
+
+        int ready = poll(&pollfd, 1, timeout_ms);
+        if (ready == -1) {
+            warn("%s: poll error: %s\n", __func__, strerror(errno));
+        } else if (ready == 0) {
+            // child is still running. Ignore unless a timeout was set.
+            if (timeout_ms > 0)
+                warn("%s: timeout waiting for process %s\n", __func__, script);
+        } else {
+            // child has exited
+            int ret = 0, wstatus = 0;
+            ret = waitpid(pid1, &wstatus, WNOHANG);
+            if (ret <= 0) {
+                warn("%s: waitpid error: %s\n", __func__, strerror(errno));
+            } else {
+                if (WIFEXITED(wstatus)) {
+                    debug("%s: child exited, status=%d\n", __func__, WEXITSTATUS(wstatus));
+                } else if (WIFSIGNALED(wstatus)) {
+                    debug("%s: child killed by signal %d\n", __func__, WTERMSIG(wstatus));
+                } else {
+                    warn("%s: unknown child status 0x%x\n", __func__, wstatus);
+                }
+            }
+        }
+        close(pidfd);
+out_unblock:
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
         return;
     }
-    char summary2[1024] = { 0 };
-    snprintf(summary2, sizeof(summary2), "string:%s", summary);
+
+    // we are the child
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+
+    if (victim) {
+        char pid_str[UID_BUFSIZ] = { 0 };
+        char uid_str[UID_BUFSIZ] = { 0 };
+
+        snprintf(pid_str, UID_BUFSIZ, "%d", victim->pid);
+        snprintf(uid_str, UID_BUFSIZ, "%d", victim->uid);
+
+        setenv("EARLYOOM_PID", pid_str, 1);
+        setenv("EARLYOOM_UID", uid_str, 1);
+        setenv("EARLYOOM_NAME", victim->name, 1);
+        setenv("EARLYOOM_CMDLINE", victim->cmdline, 1);
+    }
+
+    debug("%s: exec %s\n", __func__, script);
+    execv(script, argv);
+    warn("%s: exec %s failed: %s\n", __func__, script, strerror(errno));
+    exit(1);
+}
+
+// "-n" option
+static void notify_dbus(const char* body)
+{
     char body2[1024] = "string:";
     if (body != NULL) {
         snprintf(body2, sizeof(body2), "string:%s", body);
     }
+
     // Complete command line looks like this:
-    // dbus-send --system / net.nuetzlich.SystemNotifications.Notify 'string:summary text' 'string:and body text'
-    execl("/usr/bin/dbus-send", "dbus-send", "--system", "/", "net.nuetzlich.SystemNotifications.Notify",
-        summary2, body2, NULL);
-    warn("%s: exec failed: %s\n", __func__, strerror(errno));
-    exit(1);
+    // dbus-send --system / net.nuetzlich.SystemNotifications.Notify 'string:earlyoom' 'string:and body text'
+    char* const argv[] = {
+        "dbus-send",
+        "--system",
+        "/",
+        "net.nuetzlich.SystemNotifications.Notify",
+        "string:earlyoom",
+        body2,
+        NULL
+    };
+    const char* dbus_send_path = "/usr/bin/dbus-send";
+    notify_spawn_subprocess(dbus_send_path, argv, NULL, 0);
 }
 
-static void notify_ext(const char* script, const procinfo_t* victim)
+// "-N" option
+static void notify_ext(char* const script, const procinfo_t* victim)
 {
-    pid_t pid1 = fork();
-
-    if (pid1 == -1) {
-        warn("notify_ext: fork() returned -1: %s\n", strerror(errno));
-        return;
-    } else if (pid1 != 0) {
-        return;
-    }
-
-    char pid_str[UID_BUFSIZ] = { 0 };
-    char uid_str[UID_BUFSIZ] = { 0 };
-
-    snprintf(pid_str, UID_BUFSIZ, "%d", victim->pid);
-    snprintf(uid_str, UID_BUFSIZ, "%d", victim->uid);
-
-    setenv("EARLYOOM_PID", pid_str, 1);
-    setenv("EARLYOOM_UID", uid_str, 1);
-    setenv("EARLYOOM_NAME", victim->name, 1);
-    setenv("EARLYOOM_CMDLINE", victim->cmdline, 1);
-
-    execl(script, script, NULL);
-    warn("%s: exec %s failed: %s\n", __func__, script, strerror(errno));
-    exit(1);
+    char* const argv[] = {
+        script,
+        NULL
+    };
+    notify_spawn_subprocess(script, argv, victim, 0);
 }
 
 static void notify_process_killed(const poll_loop_args_t* args, const procinfo_t* victim)
@@ -128,18 +216,22 @@ static void notify_process_killed(const poll_loop_args_t* args, const procinfo_t
         char notif_args[PATH_MAX + 1000];
         snprintf(notif_args, sizeof(notif_args),
             "Low memory! Killing process %d %s", victim->pid, victim->name);
-        notify_dbus("earlyoom", notif_args);
+        notify_dbus(notif_args);
     }
     if (args->notify_ext) {
         notify_ext(args->notify_ext, victim);
     }
 }
 
-#if defined(__NR_pidfd_open) && defined(__NR_process_mrelease)
-#define HAVE_MRELEASE
-#else
-#warning process_mrelease is not supported. earlyoom will still work but with degraded performance.
-#endif
+// "-P" option
+static void kill_process_prehook(const poll_loop_args_t* args, const procinfo_t* victim)
+{
+    char* const argv[] = {
+        args->kill_process_prehook,
+        NULL,
+    };
+    notify_spawn_subprocess(args->kill_process_prehook, argv, victim, PREHOOK_STARTUP_SLEEP_MS);
+}
 
 // kill_release kills a process and calls process_mrelease to
 // release the memory as quickly as possible.
@@ -155,14 +247,14 @@ int kill_release(const pid_t pid, const int pidfd, const int sig)
     if (pidfd < 0) {
         return 0;
     }
-#if defined(HAVE_MRELEASE)
-    res = (int)syscall(__NR_process_mrelease, pidfd, 0);
+
+    res = process_mrelease(pidfd, 0);
     if (res != 0) {
         warn("%s: pid=%d: process_mrelease pidfd=%d failed: %s\n", __func__, pid, pidfd, strerror(errno));
     } else {
         info("%s: pid=%d: process_mrelease pidfd=%d success\n", __func__, pid, pidfd);
     }
-#endif
+
     // Return 0 regardless of process_mrelease outcome
     return 0;
 }
@@ -190,17 +282,13 @@ int kill_wait(const poll_loop_args_t* args, pid_t pid, int sig)
         warn("killing whole process group %d (-g flag is active)\n", res);
     }
 
-#if defined(HAVE_MRELEASE)
     // Open the pidfd *before* calling kill().
     if (!args->kill_process_group && sig != 0) {
-        pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
+        pidfd = pidfd_open(pid, 0);
         if (pidfd < 0) {
             warn("%s pid %d: error opening pidfd: %s\n", __func__, pid, strerror(errno));
         }
     }
-#else
-    warn("%s pid %d: system does not support process_mrelease, skipping\n", __func__, pid);
-#endif
 
     int res = kill_release(pid, pidfd, sig);
     if (res != 0) {
@@ -520,7 +608,7 @@ void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victi
     if (victim->pid <= 0) {
         warn("Could not find a process to kill. Sleeping 1 second.\n");
         if (args->notify) {
-            notify_dbus("earlyoom", "Error: Could not find a process to kill. Sleeping 1 second.");
+            notify_dbus("Error: Could not find a process to kill. Sleeping 1 second.");
         }
         sleep(1);
         return;
@@ -536,9 +624,17 @@ void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victi
     }
     // sig == 0 is used as a self-test during startup. Don't notify the user.
     if (sig != 0 || enable_debug) {
-        warn("sending %s to process %d uid %d \"%s\": oom_score %d, VmRSS %lld MiB, cmdline \"%s\"\n",
-            sig_name, victim->pid, victim->uid, victim->name, victim->oom_score, victim->VmRSSkiB / 1024,
+        warn("sending %s to process %d uid %d \"%s\": oom_score %d, oom_score_adj %d, VmRSS %lld MiB, cmdline \"%s\"\n",
+            sig_name, victim->pid, victim->uid, victim->name, victim->oom_score, victim->oom_score_adj, victim->VmRSSkiB / 1024,
             victim->cmdline);
+    }
+
+    // Invoke program BEFORE killing a process. There is a small risk that there
+    // is not enough memory to spawn it, warn; and a brief period of waiting to
+    // let the program be able to start and do something meaningful.
+    if (sig != 0 && args->kill_process_prehook) {
+        debug("going to invoke program before killing: %s\n", args->kill_process_prehook);
+        kill_process_prehook(args, victim);
     }
 
     int res = kill_wait(args, victim->pid, sig);
@@ -557,7 +653,7 @@ void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victi
     if (res != 0) {
         warn("kill failed: %s\n", strerror(saved_errno));
         if (args->notify) {
-            notify_dbus("earlyoom", "Error: Failed to kill process");
+            notify_dbus("Error: Failed to kill process");
         }
         // Killing the process may have failed because we are not running as root.
         // In that case, trying again in 100ms will just yield the same error.

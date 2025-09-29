@@ -79,6 +79,14 @@ static void startup_selftests(poll_loop_args_t* args)
             warn("%s: -N: notify script '%s' is not executable: %s\n", __func__, args->notify_ext, strerror(errno));
         }
     }
+    if (args->kill_process_prehook) {
+        if (args->kill_process_prehook[0] != '/') {
+            warn("%s: -P: pre-hook program '%s' is not an absolute path, disabling -P\n", __func__, args->kill_process_prehook);
+            args->kill_process_prehook = NULL;
+        } else if (access(args->kill_process_prehook, X_OK)) {
+            warn("%s: -P: pre-hook program '%s' is not executable: %s\n", __func__, args->kill_process_prehook, strerror(errno));
+        }
+    }
 
 #ifdef PROFILE_FIND_LARGEST_PROCESS
     struct timespec t0 = { 0 }, t1 = { 0 };
@@ -100,6 +108,27 @@ static void startup_selftests(poll_loop_args_t* args)
         }
     };
 #endif
+}
+
+static void
+handle_sigchld(__attribute__((unused)) int sig)
+{
+    pid_t pid;
+    int wstatus;
+
+    while (true) {
+        pid = waitpid(-1, &wstatus, WNOHANG);
+        if (pid <= 0) {
+            return;
+        }
+        if (WIFEXITED(wstatus)) {
+            debug("%s: pid %d exited, status=%d\n", __func__, pid, WEXITSTATUS(wstatus));
+        } else if (WIFSIGNALED(wstatus)) {
+            debug("%s: pid %d killed by signal %d\n", __func__, pid, WTERMSIG(wstatus));
+        } else {
+            debug("%s: pid %d status 0x%x\n", __func__, pid, wstatus);
+        }
+    }
 }
 
 int main(int argc, char* argv[])
@@ -127,7 +156,7 @@ int main(int argc, char* argv[])
     setlinebuf(stdout);
 
     /* clean up dbus-send zombies */
-    signal(SIGCHLD, SIG_IGN);
+    signal(SIGCHLD, handle_sigchld);
 
     fprintf(stderr, "earlyoom " VERSION "\n");
 
@@ -147,7 +176,7 @@ int main(int argc, char* argv[])
     meminfo_t m = parse_meminfo();
 
     int c;
-    const char* short_opt = "m:s:M:S:kingN:dvr:ph";
+    const char* short_opt = "m:s:M:S:kingN:P:dvr:ph";
     struct option long_opt[] = {
         { "prefer", required_argument, NULL, LONG_OPT_PREFER },
         { "avoid", required_argument, NULL, LONG_OPT_AVOID },
@@ -228,6 +257,9 @@ int main(int argc, char* argv[])
             break;
         case 'N':
             args.notify_ext = optarg;
+            break;
+        case 'P':
+            args.kill_process_prehook = optarg;
             break;
         case 'd':
             enable_debug = 1;
