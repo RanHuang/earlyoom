@@ -4,17 +4,35 @@ set -euo pipefail
 cd $(dirname ${BASH_SOURCE[0]})
 WORK_DIR=$(pwd)
 
-# install git pandoc
-if [ -d /etc/yum.repos.d ]; then
-    echo "REHL-based"
-    sudo yum install -y git pandoc
-elif [ -d /etc/apt ]; then
-    echo "Debian-based"
-    sudo apt install -y  git pandoc
-else
-    echo "Unknown distribution"
-    exit 1
-fi
+# install git pandoc if not present
+install_packages() {
+    local packages=()
+    if ! command -v git &> /dev/null; then
+        packages+=("git")
+    fi
+    if ! command -v pandoc &> /dev/null; then
+        packages+=("pandoc")
+    fi
+    
+    if [ ${#packages[@]} -eq 0 ]; then
+        echo "git and pandoc are already installed"
+        return
+    fi
+    
+    echo "Installing missing packages: ${packages[*]}"
+    if [ -d /etc/yum.repos.d ]; then
+        echo "REHL-based"
+        sudo yum install -y "${packages[@]}"
+    elif [ -d /etc/apt ]; then
+        echo "Debian-based"
+        sudo apt install -y "${packages[@]}"
+    else
+        echo "Unknown distribution"
+        exit 1
+    fi
+}
+
+install_packages
 
 if [ -d /etc/yum.repos.d ]; then
     # remove parameter '-k' which gzip not supports in CentOS
