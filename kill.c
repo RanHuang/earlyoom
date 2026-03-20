@@ -480,6 +480,11 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
                     }
                 }
                 cur->VmRSSkiB += vmrss_avoid;
+                if (cur->VmRSSkiB <= 0) {
+                    warn("%s: pid %d \"%s\": avoided, adjusted VmRSSkiB <= 0\n",
+                        __func__, cur->pid, cur->name);
+                    return false;
+                }
             } else {
                 cur->oom_score += OOM_SCORE_AVOID;
             }
