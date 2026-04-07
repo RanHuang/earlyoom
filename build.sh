@@ -40,22 +40,36 @@ if [ -d /etc/yum.repos.d ]; then
     cat Makefile  | grep gzip
 fi
 
-# get the latest tag
-tag=$(git describe --tags --abbrev=0) && version=$tag
-echo "version: $version"
+# get version
+if [ $# -ge 1 ]; then
+    version=$1
+    tag=$version
+    echo "using provided version: $version"
+else
+    # get the latest tag
+    tag=$(git describe --tags --abbrev=0) && version=$tag
+    echo "version: $version"
+fi
+
 arch=$(uname -m)
 echo "arch: $arch"
 
 cd $WORK_DIR
-git show-ref --tags --quiet --verify -- "refs/tags/$tag"
-if [ $? -ne 0 ]; then
-    echo -e "Tag \033[31m $tag \033[0m not exist. exit..."
-    exit 1
+# only check tag if version is from git tag
+if [ $# -eq 0 ]; then
+    git show-ref --tags --quiet --verify -- "refs/tags/$tag"
+    if [ $? -ne 0 ]; then
+        echo -e "Tag \033[31m $tag \033[0m not exist. exit..."
+        exit 1
+    fi
 fi
 
 origin_branch=$(git rev-parse --abbrev-ref HEAD)
-# create a new branch by tag
-git checkout -b package$$ $tag
+
+if [ $# -eq 0 ]; then
+    # create a new branch by tag only when using git tag
+    git checkout -b package$$ $tag
+fi
 
 make clean
 # static build
@@ -87,9 +101,11 @@ pkg=earlyoom-${arch}-${version}.tar.gz && rm -rf $pkg
 tar -czvf $pkg $package_dir
 rm -rf $package_dir
 
-# To clean up local branchs for package
-git checkout $origin_branch
-git fetch --prune && git branch -vv | grep -v origin | grep package | awk '{print $1}' | xargs git branch -D
+# To clean up local branchs for package only when using git tag
+if [ $# -eq 0 ]; then
+    git checkout $origin_branch
+    git fetch --prune && git branch -vv | grep -v origin | grep package | awk '{print $1}' | xargs git branch -D
+fi
 # package info
 ls -alh $WORK_DIR/$pkg
 md5sum $pkg
